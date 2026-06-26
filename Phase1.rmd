@@ -1,0 +1,279 @@
+---
+output:
+  word_document: default
+  html_document: default
+---
+# Phase 1: Descriptive Analytics
+## Dallas Nifong
+
+```{r}
+# Load Packages
+library(tidyverse)
+library(GGally)
+library(ggcorrplot)
+library(naniar)
+library(skimr)
+library(gridExtra)
+```
+
+```{r}
+# Phase 1 chart themes
+library(scales)
+
+theme_phase1 <- theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 15, margin = margin(b = 4)),
+    plot.subtitle = element_text(color = "grey35", size = 11, margin = margin(b = 12)),
+    plot.caption  = element_text(color = "grey50", size = 9, hjust = 0),
+    axis.title    = element_text(color = "grey30"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "top",
+    plot.title.position = "plot"
+  )
+
+fail_cols <- c("No" = "#B0B7BC", "Yes" = "#C0392B")
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 4.5, dpi = 150,
+                      out.width = "100%")
+```
+
+
+```{r}
+# Load data
+train <- read_csv("train.csv")
+```
+
+```{r}
+# Convert categoricals to factors
+train <- train %>%
+  mutate(failure      = as_factor(failure),
+         product_code = as_factor(product_code),
+         attribute_0  = as_factor(attribute_0),
+         attribute_1  = as_factor(attribute_1),
+         attribute_2  = as_factor(attribute_2),
+         attribute_3  = as_factor(attribute_3))
+```
+
+```{r}
+# Structure
+str(train)
+```
+
+```{r}
+# Remove ID
+train <- train %>% select(-id)
+```
+
+
+```{r}
+# Summary
+summary(train)
+```
+
+```{r}
+# Bundle missingness and distribution shape
+skim(train)
+```
+
+```{r}
+# Target distribution
+train %>% count(failure) %>% mutate(pct = n / sum(n))
+```
+
+```{r}
+# Missingness Analysis
+
+# Missingness bar
+
+# Labels for display only, rename columns on a throwaway copy
+train_labeled <- train
+names(train_labeled) <- names(train_labeled) %>%
+  str_replace_all("_", " ") %>%        # underscores -> spaces
+  str_to_title()                       # Title Case
+
+gg_miss_var(train_labeled) +
+  labs(
+    title    = "Missing data climbs with measurement number",
+    subtitle = "Higher-numbered lab measurements have the most gaps",
+    x = NULL,
+    y = "Number of Missing Values"
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_phase1 +
+  theme(panel.grid.major.y = element_blank())
+
+# Clustered map
+set.seed(123)
+train %>%
+  slice_sample(n = 3000) %>%
+  vis_miss(cluster = TRUE) +
+  labs(title = "Missingness is scattered, not concentrated in certain products") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 0, size = 7))
+
+# Overall & per-variable missing rates table
+train %>%
+  summarize(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(train), 2)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+# Rows with at least one missing value
+train %>%
+  summarize(rows_with_any_na = mean(!complete.cases(.))) %>%
+  mutate(rows_with_any_na = round(100 * rows_with_any_na, 1))
+
+# Missingness to failure
+train %>%
+  mutate(loading_missing = is.na(loading)) %>%
+  group_by(loading_missing) %>%
+  summarize(failure_rate = round(100 * mean(failure == "Yes"), 2),
+            n = n())
+```
+
+```{r}
+# Resolve missingness
+library(mice)
+
+# Loading is missing in <1% of rows, drop those rows.
+train <- train %>% drop_na(loading)
+
+# Remaining gaps (measurements, up to ~8-9%) filled with PMM via mice.
+imp   <- mice(train, method = "pmm", m = 5, seed = 123, printFlag = FALSE)
+train <- complete(imp)
+
+# Confirm no missing values remain.
+sum(is.na(train))
+```
+
+
+```{r}
+# Loading split by failure
+overall_med <- median(train$loading, na.rm = TRUE)
+
+overall_med <- median(train$loading, na.rm = TRUE)
+
+ggplot(train, aes(x = failure, y = loading, fill = failure)) +
+  geom_hline(yintercept = overall_med, linetype = "dashed",
+             color = "grey60", linewidth = 0.4) +
+  geom_boxplot(width = 0.55, outlier.alpha = 0.15,
+               outlier.size = 0.7, linewidth = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 3, fill = "white", color = "grey20") +
+  scale_fill_manual(values = fail_cols) +
+  scale_x_discrete(labels = c("No" = "Passed", "Yes" = "Failed")) +
+  labs(
+    title    = "Failed products absorbed more fluid",
+    subtitle = "Loading is the single strongest signal of failure (median 132 vs 120)",
+    x = "Product outcome",
+    y = "Loading (fluid absorbed)",
+    caption  = "Diamond = mean.  Dashed line = overall median.  Outliers shown at low opacity."
+  ) +
+  theme_phase1 +
+  theme(legend.position = "none")
+
+train %>% group_by(failure) %>%
+  summarize(mean_loading = mean(loading, na.rm = TRUE),
+            median_loading = median(loading, na.rm = TRUE))
+```
+
+```{r}
+quant_levels <- c("Loading",
+                  paste("Measurement", 0:17))   # Loading, Measurement 0 ... 17 in order
+
+train %>%
+  select(failure, loading, starts_with("measurement_")) %>%
+  pivot_longer(-failure, names_to = "variable", values_to = "value") %>%
+  mutate(variable = str_to_title(str_replace_all(variable, "_", " ")),
+         variable = factor(variable, levels = quant_levels)) %>%   # lock the order
+  ggplot(aes(x = failure, y = value, fill = failure)) +
+  geom_boxplot(outlier.alpha = 0.1, outlier.size = 0.5, linewidth = 0.4) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 5) +
+  scale_fill_manual(values = fail_cols) +
+  scale_x_discrete(labels = c("No" = "Passed", "Yes" = "Failed")) +
+  labs(
+    title    = "Loading is the only predictor that separates failures",
+    subtitle = "Across all 19 quantitative measures, only loading shifts between passed and failed products",
+    x = NULL, y = NULL
+  ) +
+  theme_phase1 +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 8),
+        strip.text = element_text(size = 9))
+```
+
+```{r}
+train %>%
+  select(failure, product_code, attribute_0, attribute_1, attribute_2, attribute_3) %>%
+  pivot_longer(-failure, names_to = "variable", values_to = "level") %>%
+  mutate(
+    variable = str_to_title(str_replace_all(variable, "_", " ")),
+    level    = str_to_title(str_replace_all(level, "_", " "))   # "material_5" -> "Material 5"
+  ) %>%
+  ggplot(aes(x = level, fill = failure)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ variable, scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = fail_cols, labels = c("No" = "Passed", "Yes" = "Failed")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title    = "None of the categorical predictors separate failures",
+    subtitle = "Failure rate holds near 21% across every product code and attribute level",
+    x = NULL, y = "Proportion", fill = NULL
+  ) +
+  theme_phase1 +
+  theme(
+    strip.text  = element_text(size = 9),
+    axis.text.x = element_text(size = 8)
+  )
+```
+
+
+```{r}
+# Product code chart
+pc_summary <- train %>%
+  group_by(product_code) %>%
+  summarize(fail_rate = mean(failure == "Yes"))
+
+ggplot(pc_summary, aes(x = product_code, y = fail_rate)) +
+  geom_col(fill = "#C0392B", width = 0.65) +
+  geom_text(aes(label = scales::percent(fail_rate, accuracy = 0.1)),
+            vjust = -0.5, size = 4, color = "grey20") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.28),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "Failure rate is nearly identical across product types",
+    subtitle = "Which prototype a product is tells you little about whether it fails",
+    x = "Product Code", y = "Failure Rate"
+  ) +
+  theme_phase1 +
+  theme(panel.grid.major.x = element_blank())
+```
+
+## What the data tells us
+
+**The amount of fluid a product absorbs is the clearest warning sign of failure.**
+Products that absorbed more fluid are more likely to fail. On average, failed
+products absorbed 132 units versus 120 for a product that passed, so a noticeable
+difference.
+
+**The individual lab tests, on their own, tell us little.** 
+Of the eighteen lab measurements, none show a meaningful relationship with failure 
+individually. This doesn't mean they are useless, combinations of them may still matter
+when I build models in Phase 2.
+
+**The type of product doesn't change the odds of failure.** 
+This data covered five different product recipes, all five fail at roughly the
+same rate (about 20-23%).
+
+**The data is incomplete, so it was cleaned.**
+More than half of all products were missing at least one lab measurement.
+The small number of rows missing a "loading" value (under 1%) were dropped,
+and the remaining gaps were filled using predictive mean matching.
+
+## Bottom line
+
+If Keep It Dry wants an early warning that a product might fail, I believe "loading" 
+is the most promising signal found so far. The lab tests and the product type alone
+don't say much, but they may matter in Phase 2 once a model can weigh several of them
+together.
